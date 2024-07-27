@@ -3,6 +3,7 @@
 
 import threading
 from copy import copy
+from time import time
 from timeit import default_timer
 from uuid import uuid4
 
@@ -23,6 +24,12 @@ from searx.metrics import initialize as initialize_metrics, counter_inc, histogr
 from searx.search.processors import PROCESSORS, initialize as initialize_processors
 from searx.search.checker import initialize as initialize_checker
 
+# translation stuff
+print('[Debug] Loading LLM. It will take some time')
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+tokenizer = AutoTokenizer.from_pretrained('facebook/nllb-200-distilled-600M', src_lang='eng_Latn')
+model = AutoModelForSeq2SeqLM.from_pretrained('facebook/nllb-200-distilled-600M')
+print('[Debug] LLM loaded')
 
 logger = logger.getChild('search')
 
@@ -88,6 +95,20 @@ class Search:
         # max of all selected engine timeout
         default_timeout = 0
 
+        # first, translate the query:
+        translationTimeStart = time()
+        queries = [(self.search_query.query, 'en')] # we assume it's english
+        print('[Debug] begin translation')
+        inputs  = tokenizer(self.search_query.query, return_tensors='pt')
+        for lang,bcp in (('pt','por_Latn'),('fr','fra_Latn'),('es','spa_Latn'),('de','deu_Latn')):
+          translated_tokens = model.generate(**inputs, forced_bos_token_id=tokenizer.encode(bcp)[1])
+          translated_query  = tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
+          print('[Debug] Query: ', self.search_query.query, '->', translated_query)
+          queries.append((translated_query, lang))
+        print('[Debug] translated them all')
+        translationTime = int(time() - translationTimeStart) + 1 # ceil
+        # ------
+
         # start search-request for all selected engines
         for engineref in self.search_query.engineref_list:
             processor = PROCESSORS[engineref.name]
@@ -103,8 +124,11 @@ class Search:
 
             counter_inc('engine', engineref.name, 'search', 'count', 'sent')
 
-            # append request to list
-            requests.append((engineref.name, self.search_query.query, request_params))
+            # append requests to list:
+            for query,lang in queries:
+              request_tran_params = request_params.copy()
+              request_tran_params['searxng_locale'] = request_tran_params['language'] = lang
+              requests.append((engineref.name, query, request_tran_params))
 
             # update default_timeout
             default_timeout = max(default_timeout, processor.engine.timeout)
@@ -133,7 +157,9 @@ class Search:
             )
         )
 
-        return requests, actual_timeout
+        # we have do add the translation overhead or else we always have
+        # timeout errors. This won't be necessary when the llm run on gpu.
+        return requests, actual_timeout + translationTime
 
     def search_multiple_requests(self, requests):
         # pylint: disable=protected-access
